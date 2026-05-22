@@ -576,11 +576,16 @@ func enrichCRT(domain string, out chan<- string) {
 	if _, loaded := crtSeen.LoadOrStore(apex, struct{}{}); loaded {
 		return
 	}
-	// Add to WaitGroup before launching the goroutine to avoid a race with crtWg.Wait().
-	// The semaphore is acquired inside the goroutine so the writer is never blocked here.
+	// Non-blocking acquire: if all CRT_CONCUR slots are busy we drop this apex
+	// rather than spawning an unbounded goroutine queue that blocks crtWg.Wait()
+	// for hours when tens of thousands of unique apexes are discovered.
+	select {
+	case crtSem <- struct{}{}:
+	default:
+		return // slots full, skip
+	}
 	crtWg.Add(1)
 	go func() {
-		crtSem <- struct{}{} // block inside goroutine, not in the writer
 		defer func() {
 			<-crtSem
 			crtWg.Done()
