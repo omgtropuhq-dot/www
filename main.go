@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -20,16 +22,17 @@ import (
 
 const (
 	WORKERS       = 300
-	ROUNDS        = 2 // distinct sources queried per IP
+	ROUNDS        = 3 // distinct sources to query per IP
 	JOB_BUF       = 50_000
 	RESULT_BUF    = 100_000
 	HTTP_TIMEOUT  = 10 * time.Second
 	MAX_RETRIES   = 2
 	BACKOFF_BASE  = 400 * time.Millisecond
-	ERR_THRESHOLD = 6
-	ERR_RESET     = 90 // seconds
-	CRT_CONCUR    = 15
+	ERR_THRESHOLD = 8
+	ERR_RESET     = 60 // seconds before re-enabling a disabled source
+	CRT_CONCUR    = 5
 	STATS_EVERY   = 15 * time.Second
+	FLUSH_EVERY   = 2 * time.Second
 )
 
 // ─────────────────────────────────────────────
@@ -74,7 +77,7 @@ var httpClient = &http.Client{
 	Timeout: HTTP_TIMEOUT,
 	Transport: &http.Transport{
 		MaxIdleConns:        800,
-		MaxIdleConnsPerHost: 100,
+		MaxIdleConnsPerHost: 150,
 		IdleConnTimeout:     60 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -89,21 +92,32 @@ var httpClient = &http.Client{
 // ─────────────────────────────────────────────
 
 type Source struct {
-	name       string
-	weight     int
+	name   string
+	weight int
+	// sem limits concurrent requests to this source.
+	// tryAcquire is non-blocking: workers skip full sources instead of waiting.
+	sem        chan struct{}
 	errCount   int32
 	disabledAt int64
-	// per-source stats
+	// stats
 	reqTotal   uint64
 	reqSuccess uint64
+	reqSkipped uint64 // at-capacity skips
 	domsFound  uint64
 }
 
+func newSource(name string, weight, maxConc int) *Source {
+	return &Source{name: name, weight: weight, sem: make(chan struct{}, maxConc)}
+}
+
 var sources = []*Source{
-	{name: "robtex", weight: 1},
-	{name: "rapiddns", weight: 4},
-	{name: "crtsh_ip", weight: 1},
-	{name: "webscan", weight: 4},
+	//               name          weight  maxConc
+	newSource("robtex",     1,   5),
+	newSource("rapiddns",   3,  20),
+	newSource("crtsh_ip",   1,   3), // strict rate-limit: low concurrency
+	newSource("webscan",    3,  20),
+	newSource("urlscan",    2,  12),
+	newSource("viewdns",    3,  20), // no hard rate-limit on free web interface
 }
 
 func (s *Source) isDisabled() bool {
@@ -152,9 +166,9 @@ func init() {
 	}
 }
 
-// nextSource returns a round-robin source starting from offset idx.
-// Scanning linearly avoids spinning and distributes load fairly across workers.
-func pickSources(startIdx uint64, skip map[string]bool) *Source {
+// pickSource scans the weighted pool from startIdx and returns the first
+// source that is neither disabled nor already in the skip set.
+func pickSource(startIdx uint64, skip map[string]bool) *Source {
 	n := uint64(len(pool))
 	for i := uint64(0); i < n; i++ {
 		s := pool[(startIdx+i)%n]
@@ -169,7 +183,6 @@ func pickSources(startIdx uint64, skip map[string]bool) *Source {
 //  FETCHERS
 // ─────────────────────────────────────────────
 
-// isHTML detects HTML error pages that some APIs return instead of JSON.
 func isHTML(body string) bool {
 	t := strings.TrimSpace(body)
 	if len(t) == 0 {
@@ -234,7 +247,7 @@ func fetchRobtex(ip string) (string, error) {
 		return "", err
 	}
 	if isHTML(body) {
-		return "", fmt.Errorf("robtex: HTML response (rate-limited?)")
+		return "", fmt.Errorf("HTML response (rate-limited?)")
 	}
 	return body, nil
 }
@@ -249,7 +262,7 @@ func fetchCRTSHByIP(ip string) (string, error) {
 		return "", err
 	}
 	if isHTML(body) {
-		return "", fmt.Errorf("crtsh: HTML response (rate-limited?)")
+		return "", fmt.Errorf("HTML response (rate-limited?)")
 	}
 	return body, nil
 }
@@ -258,9 +271,69 @@ func fetchWebscan(ip string) (string, error) {
 	return doGET("https://api.webscan.cc/?action=query&ip=" + ip)
 }
 
-func query(s *Source, ip string) string {
+// fetchViewDNS scrapes viewdns.info with browser-like headers to avoid WAF blocks.
+func fetchViewDNS(ip string) (string, error) {
+	cl := &http.Client{Timeout: HTTP_TIMEOUT, Transport: httpClient.Transport}
+	u := "https://viewdns.info/reverseip/?host=" + ip
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Referer", "https://viewdns.info/")
+	req.Header.Set("DNT", "1")
+	req.Header.Set("Connection", "keep-alive")
+	resp, err := cl.Do(req)
+	if err != nil {
+		return "", err
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body := string(b)
+	if isHTML(body) && !strings.Contains(body, "<td>") {
+		return "", fmt.Errorf("viewdns: empty or blocked page")
+	}
+	return body, nil
+}
+
+func fetchURLScan(ip string) (string, error) {
+	body, err := doGETWithTimeout(
+		fmt.Sprintf("https://urlscan.io/api/v1/search/?q=ip%%3A%s&size=100", ip),
+		15*time.Second, 1,
+	)
+	if err != nil {
+		return "", err
+	}
+	if isHTML(body) {
+		return "", fmt.Errorf("HTML response (rate-limited?)")
+	}
+	return body, nil
+}
+
+// query makes an HTTP request to source s for ip.
+// Returns ("", false) immediately if the source's concurrency cap is reached —
+// workers must not block on slow/rate-limited sources.
+// Returns (body, true) when the request was attempted (body may be "" on error).
+func query(s *Source, ip string) (body string, attempted bool) {
+	// Non-blocking semaphore acquire: skip if at capacity.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	default:
+		atomic.AddUint64(&s.reqSkipped, 1)
+		return "", false
+	}
+
 	atomic.AddUint64(&s.reqTotal, 1)
-	var body string
 	var err error
 	switch s.name {
 	case "robtex":
@@ -271,14 +344,18 @@ func query(s *Source, ip string) string {
 		body, err = fetchCRTSHByIP(ip)
 	case "webscan":
 		body, err = fetchWebscan(ip)
+	case "urlscan":
+		body, err = fetchURLScan(ip)
+	case "viewdns":
+		body, err = fetchViewDNS(ip)
 	}
 	if err != nil {
 		s.fail()
-		logWarn("%-10s %-16s → %v", s.name, ip, err)
-		return ""
+		logWarn("%-12s %-16s → %v", s.name, ip, err)
+		return "", true
 	}
 	s.ok()
-	return body
+	return body, true
 }
 
 // ─────────────────────────────────────────────
@@ -289,7 +366,7 @@ var seen sync.Map
 
 func clean(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.TrimSuffix(s, ".") // Robtex FQDNs have a trailing dot
+	s = strings.TrimSuffix(s, ".") // Robtex appends a trailing dot to FQDNs
 	s = strings.TrimPrefix(s, "*.")
 	if len(s) < 4 || !strings.Contains(s, ".") {
 		return ""
@@ -312,7 +389,6 @@ func emit(d string, out chan<- string) bool {
 	return false
 }
 
-// parseRobtex handles NDJSON; skips heartbeat lines ({"time":N}, {"msg":"..."}).
 func parseRobtex(body string, out chan<- string) int {
 	count := 0
 	for _, line := range strings.Split(body, "\n") {
@@ -324,17 +400,14 @@ func parseRobtex(body string, out chan<- string) int {
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			continue
 		}
-		// heartbeat / error lines carry "msg" or only "time"
 		if _, hasMsg := obj["msg"]; hasMsg {
-			continue
+			continue // heartbeat / error line
 		}
 		for _, k := range []string{"rrname", "rdata"} {
 			if raw, ok := obj[k]; ok {
 				var v string
-				if json.Unmarshal(raw, &v) == nil {
-					if emit(v, out) {
-						count++
-					}
+				if json.Unmarshal(raw, &v) == nil && emit(v, out) {
+					count++
 				}
 			}
 		}
@@ -342,7 +415,6 @@ func parseRobtex(body string, out chan<- string) int {
 	return count
 }
 
-// crtEntry covers both the IP-query and the apex-wildcard responses.
 type crtEntry struct {
 	CommonName string `json:"common_name"`
 	NameValue  string `json:"name_value"`
@@ -414,6 +486,75 @@ func parseWebscan(body string, out chan<- string) int {
 	return count
 }
 
+// parseViewDNS scrapes the HTML table from viewdns.info reverseip.
+// The results table contains two columns: domain name and last resolved date.
+func parseViewDNS(body string, out chan<- string) int {
+	count := 0
+	// Find the results table (skip the first two header tables)
+	tableStart := 0
+	for i := 0; i < 3; i++ {
+		idx := strings.Index(body[tableStart:], "<table")
+		if idx == -1 {
+			return 0
+		}
+		tableStart += idx + 1
+	}
+	section := body[tableStart:]
+	tableEnd := strings.Index(section, "</table>")
+	if tableEnd != -1 {
+		section = section[:tableEnd]
+	}
+	for {
+		start := strings.Index(section, "<td>")
+		if start == -1 {
+			break
+		}
+		section = section[start+4:]
+		end := strings.Index(section, "</td>")
+		if end == -1 {
+			break
+		}
+		tok := strings.TrimSpace(section[:end])
+		section = section[end+5:]
+		// Skip the "Last Resolved" date column (contains digits and dashes only)
+		if !strings.Contains(tok, "<") && strings.Contains(tok, ".") {
+			if emit(tok, out) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func parseURLScan(body string, out chan<- string) int {
+	var result struct {
+		Results []struct {
+			Page struct {
+				Domain string `json:"domain"`
+				URL    string `json:"url"`
+			} `json:"page"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		return 0
+	}
+	count := 0
+	for _, r := range result.Results {
+		if emit(r.Page.Domain, out) {
+			count++
+		}
+		u := r.Page.URL
+		u = strings.TrimPrefix(u, "http://")
+		u = strings.TrimPrefix(u, "https://")
+		if host := strings.SplitN(u, "/", 2)[0]; host != r.Page.Domain {
+			if emit(host, out) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func parseBody(src, body string, out chan<- string) int {
 	switch src {
 	case "robtex":
@@ -424,6 +565,10 @@ func parseBody(src, body string, out chan<- string) int {
 		return parseCRTSH(body, out)
 	case "webscan":
 		return parseWebscan(body, out)
+	case "urlscan":
+		return parseURLScan(body, out)
+	case "viewdns":
+		return parseViewDNS(body, out)
 	}
 	return 0
 }
@@ -435,7 +580,7 @@ func parseBody(src, body string, out chan<- string) int {
 var (
 	crtSeen sync.Map
 	crtSem  = make(chan struct{}, CRT_CONCUR)
-	// crtWg tracks goroutines so main can wait before closing results.
+	// crtWg prevents closing results while goroutines are still writing to it.
 	crtWg sync.WaitGroup
 )
 
@@ -448,9 +593,11 @@ func enrichCRT(domain string, out chan<- string) {
 	if _, loaded := crtSeen.LoadOrStore(apex, struct{}{}); loaded {
 		return
 	}
-	crtSem <- struct{}{}
+	// Add to WaitGroup before launching the goroutine to avoid a race with crtWg.Wait().
+	// The semaphore is acquired inside the goroutine so the writer is never blocked here.
 	crtWg.Add(1)
 	go func() {
+		crtSem <- struct{}{} // block inside goroutine, not in the writer
 		defer func() {
 			<-crtSem
 			crtWg.Done()
@@ -499,12 +646,13 @@ func statsLoop() {
 			reqs := atomic.LoadUint64(&s.reqTotal)
 			succ := atomic.LoadUint64(&s.reqSuccess)
 			sdoms := atomic.LoadUint64(&s.domsFound)
+			skip := atomic.LoadUint64(&s.reqSkipped)
 			pct := 0.0
 			if reqs > 0 {
 				pct = float64(succ) / float64(reqs) * 100
 			}
-			logStats("  %-12s  reqs=%-6d  ok=%-6d (%.0f%%)  domains=%-8d  errs=%d  %s",
-				s.name, reqs, succ, pct, sdoms, atomic.LoadInt32(&s.errCount), state)
+			logStats("  %-12s  reqs=%-6d  ok=%-6d(%.0f%%)  skip=%-5d  doms=%-8d  errs=%d  %s",
+				s.name, reqs, succ, pct, skip, sdoms, atomic.LoadInt32(&s.errCount), state)
 		}
 	}
 }
@@ -516,18 +664,23 @@ func statsLoop() {
 func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for ip := range jobs {
-		tried := make(map[string]bool, ROUNDS)
+		tried := make(map[string]bool, len(sources))
 		queried := 0
-		// Pick a starting offset unique to this IP slot to spread load across the pool.
 		startIdx := atomic.AddUint64(&poolIdx, 1)
-		for queried < ROUNDS {
-			src := pickSources(startIdx+uint64(queried), tried)
+
+		// Scan the pool at most once to find ROUNDS enabled, available sources.
+		// Non-blocking acquire in query() means we never stall waiting for slow APIs.
+		for attempt := 0; attempt < len(pool) && queried < ROUNDS; attempt++ {
+			src := pickSource(startIdx+uint64(attempt), tried)
 			if src == nil {
-				break // all sources tried or disabled
+				break
 			}
 			tried[src.name] = true
+			body, attempted := query(src, ip)
+			if !attempted {
+				continue // at capacity — already marked tried, try next source
+			}
 			queried++
-			body := query(src, ip)
 			if body != "" {
 				n := parseBody(src.name, body, out)
 				src.addDoms(n)
@@ -552,7 +705,7 @@ func writer(results chan string, done chan<- struct{}) {
 	w := bufio.NewWriterSize(f, 256*1024)
 	defer w.Flush()
 
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(FLUSH_EVERY)
 	defer tick.Stop()
 
 	for {
@@ -580,6 +733,9 @@ func writer(results chan string, done chan<- struct{}) {
 
 func main() {
 	logInfo("starting  workers=%d  sources=%d  rounds/IP=%d", WORKERS, len(sources), ROUNDS)
+	for _, s := range sources {
+		logInfo("  %-12s  weight=%-2d  maxConc=%d", s.name, s.weight, cap(s.sem))
+	}
 
 	jobs := make(chan string, JOB_BUF)
 	results := make(chan string, RESULT_BUF)
@@ -593,6 +749,17 @@ func main() {
 
 	go writer(results, done)
 	go statsLoop()
+
+	// Graceful shutdown on SIGINT/SIGTERM: stop feeding jobs so the pipeline drains.
+	var closeOnce sync.Once
+	closeJobs := func() { closeOnce.Do(func() { close(jobs) }) }
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		logWarn("signal received — draining pipeline...")
+		closeJobs()
+	}()
 
 	f, err := os.Open("ips.txt")
 	if err != nil {
@@ -610,11 +777,11 @@ func main() {
 	}
 	f.Close()
 	logInfo("loaded %d IPs — waiting for workers...", ipCount)
-	close(jobs)
+	closeJobs()
 
 	wg.Wait()
-	logInfo("workers done — waiting for crt.sh enrichment goroutines...")
-	crtWg.Wait() // must drain before closing results to avoid panic on write to closed chan
+	logInfo("workers done — flushing crt.sh enrichment goroutines...")
+	crtWg.Wait()
 
 	close(results)
 	<-done
