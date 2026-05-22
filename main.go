@@ -353,10 +353,14 @@ func clean(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.TrimSuffix(s, ".") // Robtex appends a trailing dot to FQDNs
 	s = strings.TrimPrefix(s, "*.")
+	// Strip port number (e.g. "example.com:8080" → "example.com")
+	if i := strings.LastIndex(s, ":"); i != -1 {
+		s = s[:i]
+	}
 	if len(s) < 4 || !strings.Contains(s, ".") {
 		return ""
 	}
-	if strings.ContainsAny(s, " \t<>\"'{}[]()") {
+	if strings.ContainsAny(s, " \t<>\"'{}[]()/@") {
 		return ""
 	}
 	return s
