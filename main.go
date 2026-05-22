@@ -21,14 +21,17 @@ import (
 // ─────────────────────────────────────────────
 
 const (
-	WORKERS       = 300
-	ROUNDS        = 3 // distinct sources to query per IP
+	// WORKERS matches total source capacity (sum of all maxConc).
+	// With blocking semaphores, each worker holds exactly one source slot at a time;
+	// keeping WORKERS ≈ total slots avoids both idle workers and semaphore pile-ups.
+	WORKERS       = 80
+	ROUNDS        = 3 // distinct sources queried per IP
 	JOB_BUF       = 50_000
 	RESULT_BUF    = 100_000
 	HTTP_TIMEOUT  = 10 * time.Second
 	MAX_RETRIES   = 2
 	BACKOFF_BASE  = 400 * time.Millisecond
-	ERR_THRESHOLD = 8
+	ERR_THRESHOLD = 4  // fast disabling of unreliable sources
 	ERR_RESET     = 60 // seconds before re-enabling a disabled source
 	CRT_CONCUR    = 5
 	STATS_EVERY   = 15 * time.Second
@@ -94,15 +97,15 @@ var httpClient = &http.Client{
 type Source struct {
 	name   string
 	weight int
-	// sem limits concurrent requests to this source.
-	// tryAcquire is non-blocking: workers skip full sources instead of waiting.
+	// sem caps concurrent in-flight requests for this source.
+	// Workers block on acquire — WORKERS is sized to match total capacity so
+	// contention stays low and no worker starves indefinitely.
 	sem        chan struct{}
 	errCount   int32
 	disabledAt int64
 	// stats
 	reqTotal   uint64
 	reqSuccess uint64
-	reqSkipped uint64 // at-capacity skips
 	domsFound  uint64
 }
 
@@ -111,13 +114,14 @@ func newSource(name string, weight, maxConc int) *Source {
 }
 
 var sources = []*Source{
-	//               name          weight  maxConc
-	newSource("robtex",     1,   5),
-	newSource("rapiddns",   3,  20),
-	newSource("crtsh_ip",   1,   3), // strict rate-limit: low concurrency
-	newSource("webscan",    3,  20),
-	newSource("urlscan",    2,  12),
-	newSource("viewdns",    3,  20), // no hard rate-limit on free web interface
+	//               name          weight  maxConc  (sum = 77 ≈ WORKERS)
+	newSource("robtex",    1,   5),
+	newSource("rapiddns",  3,  20),
+	newSource("webscan",   3,  20),
+	newSource("urlscan",   2,  12),
+	newSource("viewdns",   3,  20), // works on residential IPs; cloud IPs get 403
+	// crtsh_ip removed: always timeout/429 on this env, and crt.sh data is already
+	// covered by enrichCRT() apex lookups which run independently of the worker pool.
 }
 
 func (s *Source) isDisabled() bool {
@@ -256,17 +260,6 @@ func fetchRapidDNS(ip string) (string, error) {
 	return doGET("https://rapiddns.io/sameip/" + ip + "?full=1")
 }
 
-func fetchCRTSHByIP(ip string) (string, error) {
-	body, err := doGETWithTimeout(fmt.Sprintf("https://crt.sh/?q=%s&output=json", ip), 20*time.Second, 1)
-	if err != nil {
-		return "", err
-	}
-	if isHTML(body) {
-		return "", fmt.Errorf("HTML response (rate-limited?)")
-	}
-	return body, nil
-}
-
 func fetchWebscan(ip string) (string, error) {
 	return doGET("https://api.webscan.cc/?action=query&ip=" + ip)
 }
@@ -320,28 +313,20 @@ func fetchURLScan(ip string) (string, error) {
 }
 
 // query makes an HTTP request to source s for ip.
-// Returns ("", false) immediately if the source's concurrency cap is reached —
-// workers must not block on slow/rate-limited sources.
-// Returns (body, true) when the request was attempted (body may be "" on error).
-func query(s *Source, ip string) (body string, attempted bool) {
-	// Non-blocking semaphore acquire: skip if at capacity.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	default:
-		atomic.AddUint64(&s.reqSkipped, 1)
-		return "", false
-	}
+// Blocks until a concurrency slot is available (WORKERS ≈ total slots so
+// contention is low), then performs the HTTP fetch.
+func query(s *Source, ip string) string {
+	s.sem <- struct{}{} // blocking acquire
+	defer func() { <-s.sem }()
 
 	atomic.AddUint64(&s.reqTotal, 1)
+	var body string
 	var err error
 	switch s.name {
 	case "robtex":
 		body, err = fetchRobtex(ip)
 	case "rapiddns":
 		body, err = fetchRapidDNS(ip)
-	case "crtsh_ip":
-		body, err = fetchCRTSHByIP(ip)
 	case "webscan":
 		body, err = fetchWebscan(ip)
 	case "urlscan":
@@ -352,10 +337,10 @@ func query(s *Source, ip string) (body string, attempted bool) {
 	if err != nil {
 		s.fail()
 		logWarn("%-12s %-16s → %v", s.name, ip, err)
-		return "", true
+		return ""
 	}
 	s.ok()
-	return body, true
+	return body
 }
 
 // ─────────────────────────────────────────────
@@ -561,8 +546,6 @@ func parseBody(src, body string, out chan<- string) int {
 		return parseRobtex(body, out)
 	case "rapiddns":
 		return parseRapidDNS(body, out)
-	case "crtsh_ip":
-		return parseCRTSH(body, out)
 	case "webscan":
 		return parseWebscan(body, out)
 	case "urlscan":
@@ -646,13 +629,13 @@ func statsLoop() {
 			reqs := atomic.LoadUint64(&s.reqTotal)
 			succ := atomic.LoadUint64(&s.reqSuccess)
 			sdoms := atomic.LoadUint64(&s.domsFound)
-			skip := atomic.LoadUint64(&s.reqSkipped)
+			inFlight := len(s.sem) // goroutines currently holding a slot
 			pct := 0.0
 			if reqs > 0 {
 				pct = float64(succ) / float64(reqs) * 100
 			}
-			logStats("  %-12s  reqs=%-6d  ok=%-6d(%.0f%%)  skip=%-5d  doms=%-8d  errs=%d  %s",
-				s.name, reqs, succ, pct, skip, sdoms, atomic.LoadInt32(&s.errCount), state)
+			logStats("  %-12s  reqs=%-6d  ok=%-6d(%.0f%%)  active=%-3d  doms=%-8d  errs=%d  %s",
+				s.name, reqs, succ, pct, inFlight, sdoms, atomic.LoadInt32(&s.errCount), state)
 		}
 	}
 }
@@ -668,19 +651,14 @@ func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 		queried := 0
 		startIdx := atomic.AddUint64(&poolIdx, 1)
 
-		// Scan the pool at most once to find ROUNDS enabled, available sources.
-		// Non-blocking acquire in query() means we never stall waiting for slow APIs.
 		for attempt := 0; attempt < len(pool) && queried < ROUNDS; attempt++ {
 			src := pickSource(startIdx+uint64(attempt), tried)
 			if src == nil {
 				break
 			}
 			tried[src.name] = true
-			body, attempted := query(src, ip)
-			if !attempted {
-				continue // at capacity — already marked tried, try next source
-			}
 			queried++
+			body := query(src, ip) // blocking — worker waits for a source slot
 			if body != "" {
 				n := parseBody(src.name, body, out)
 				src.addDoms(n)
