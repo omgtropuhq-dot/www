@@ -20,14 +20,51 @@ import (
 
 const (
 	WORKERS       = 300
+	ROUNDS        = 2 // distinct sources queried per IP
 	JOB_BUF       = 50_000
 	RESULT_BUF    = 100_000
 	HTTP_TIMEOUT  = 10 * time.Second
 	MAX_RETRIES   = 2
 	BACKOFF_BASE  = 400 * time.Millisecond
 	ERR_THRESHOLD = 6
-	ERR_RESET     = 90
+	ERR_RESET     = 90 // seconds
+	CRT_CONCUR    = 15
+	STATS_EVERY   = 15 * time.Second
 )
+
+// ─────────────────────────────────────────────
+//  LOGGER  (stderr · timestamp · levels · colors)
+// ─────────────────────────────────────────────
+
+var (
+	tty   = isatty(os.Stderr)
+	logMu sync.Mutex
+)
+
+func isatty(f *os.File) bool {
+	fi, _ := f.Stat()
+	return fi != nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func ansi(s, code string) string {
+	if !tty {
+		return s
+	}
+	return code + s + "\033[0m"
+}
+
+func logLine(level, code, format string, a ...interface{}) {
+	msg := fmt.Sprintf(format, a...)
+	ts := time.Now().Format("15:04:05")
+	logMu.Lock()
+	fmt.Fprintf(os.Stderr, "%s %s %s\n", ansi(ts, "\033[90m"), ansi(level, code), msg)
+	logMu.Unlock()
+}
+
+func logInfo(f string, a ...interface{})  { logLine("[INFO]", "\033[36m", f, a...) }
+func logWarn(f string, a ...interface{})  { logLine("[WARN]", "\033[33m", f, a...) }
+func logError(f string, a ...interface{}) { logLine("[ERR] ", "\033[31m", f, a...) }
+func logStats(f string, a ...interface{}) { logLine("[STAT]", "\033[32m", f, a...) }
 
 // ─────────────────────────────────────────────
 //  HTTP CLIENT
@@ -56,13 +93,17 @@ type Source struct {
 	weight     int
 	errCount   int32
 	disabledAt int64
+	// per-source stats
+	reqTotal   uint64
+	reqSuccess uint64
+	domsFound  uint64
 }
 
 var sources = []*Source{
-	{name: "robtex",   weight: 1}, // instable, poids réduit
+	{name: "robtex", weight: 1},
 	{name: "rapiddns", weight: 4},
-	{name: "crtsh_ip", weight: 1}, // lent, poids réduit
-	{name: "webscan",  weight: 4},
+	{name: "crtsh_ip", weight: 1},
+	{name: "webscan", weight: 4},
 }
 
 func (s *Source) isDisabled() bool {
@@ -73,21 +114,35 @@ func (s *Source) isDisabled() bool {
 	if time.Now().Unix()-t > ERR_RESET {
 		atomic.StoreInt64(&s.disabledAt, 0)
 		atomic.StoreInt32(&s.errCount, 0)
+		logInfo("source %s re-enabled", s.name)
 		return false
 	}
 	return true
 }
 
 func (s *Source) fail() {
-	if int(atomic.AddInt32(&s.errCount, 1)) >= ERR_THRESHOLD {
+	n := atomic.AddInt32(&s.errCount, 1)
+	if int(n) == ERR_THRESHOLD {
 		atomic.StoreInt64(&s.disabledAt, time.Now().Unix())
+		logWarn("source %s disabled after %d consecutive errors", s.name, n)
 	}
 }
 
-func (s *Source) ok() { atomic.StoreInt32(&s.errCount, 0) }
+func (s *Source) ok() {
+	atomic.StoreInt32(&s.errCount, 0)
+	atomic.AddUint64(&s.reqSuccess, 1)
+}
 
-var pool []*Source
-var poolIdx uint64
+func (s *Source) addDoms(n int) {
+	if n > 0 {
+		atomic.AddUint64(&s.domsFound, uint64(n))
+	}
+}
+
+var (
+	pool    []*Source
+	poolIdx uint64
+)
 
 func init() {
 	for _, s := range sources {
@@ -97,52 +152,39 @@ func init() {
 	}
 }
 
-func nextSource() *Source {
+// nextSource returns a round-robin source starting from offset idx.
+// Scanning linearly avoids spinning and distributes load fairly across workers.
+func pickSources(startIdx uint64, skip map[string]bool) *Source {
 	n := uint64(len(pool))
-	for i := 0; i < len(pool); i++ {
-		s := pool[atomic.AddUint64(&poolIdx, 1)%n]
-		if !s.isDisabled() {
+	for i := uint64(0); i < n; i++ {
+		s := pool[(startIdx+i)%n]
+		if !skip[s.name] && !s.isDisabled() {
 			return s
 		}
 	}
-	return sources[0]
+	return nil
 }
 
 // ─────────────────────────────────────────────
 //  FETCHERS
 // ─────────────────────────────────────────────
 
-func doGET(u string) (string, error) {
-	var lastErr error
-	for i := 0; i <= MAX_RETRIES; i++ {
-		if i > 0 {
-			time.Sleep(BACKOFF_BASE * time.Duration(i))
-		}
-		req, _ := http.NewRequest("GET", u, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		req.Header.Set("Accept", "text/html,application/json,*/*")
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		b, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode == 429 {
-			time.Sleep(2 * time.Second)
-			lastErr = fmt.Errorf("rate limited")
-			continue
-		}
-		return string(b), nil
+// isHTML detects HTML error pages that some APIs return instead of JSON.
+func isHTML(body string) bool {
+	t := strings.TrimSpace(body)
+	if len(t) == 0 {
+		return false
 	}
-	return "", lastErr
+	if t[0] == '<' {
+		return true
+	}
+	n := 120
+	if len(t) < n {
+		n = len(t)
+	}
+	return strings.Contains(strings.ToLower(t[:n]), "<!doctype")
 }
 
-// doGETWithTimeout permet un timeout et nombre de retries personnalisés par source
 func doGETWithTimeout(u string, timeout time.Duration, maxRetries int) (string, error) {
 	cl := &http.Client{Timeout: timeout, Transport: httpClient.Transport}
 	var lastErr error
@@ -150,8 +192,12 @@ func doGETWithTimeout(u string, timeout time.Duration, maxRetries int) (string, 
 		if i > 0 {
 			time.Sleep(BACKOFF_BASE * time.Duration(i*2))
 		}
-		req, _ := http.NewRequest("GET", u, nil)
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return "", err
+		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		req.Header.Set("Accept", "application/json, text/html, */*")
 		resp, err := cl.Do(req)
 		if err != nil {
 			lastErr = err
@@ -163,9 +209,14 @@ func doGETWithTimeout(u string, timeout time.Duration, maxRetries int) (string, 
 			lastErr = err
 			continue
 		}
-		if resp.StatusCode == 429 || resp.StatusCode == 503 {
+		switch resp.StatusCode {
+		case 429, 503:
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			time.Sleep(3 * time.Second)
-			lastErr = fmt.Errorf("http %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 		}
 		return string(b), nil
@@ -173,9 +224,19 @@ func doGETWithTimeout(u string, timeout time.Duration, maxRetries int) (string, 
 	return "", lastErr
 }
 
+func doGET(u string) (string, error) {
+	return doGETWithTimeout(u, HTTP_TIMEOUT, MAX_RETRIES)
+}
+
 func fetchRobtex(ip string) (string, error) {
-	// Robtex est lent/instable : timeout plus long, 1 seul retry
-	return doGETWithTimeout("https://freeapi.robtex.com/pdns/reverse/"+ip, 15*time.Second, 1)
+	body, err := doGETWithTimeout("https://freeapi.robtex.com/pdns/reverse/"+ip, 15*time.Second, 1)
+	if err != nil {
+		return "", err
+	}
+	if isHTML(body) {
+		return "", fmt.Errorf("robtex: HTML response (rate-limited?)")
+	}
+	return body, nil
 }
 
 func fetchRapidDNS(ip string) (string, error) {
@@ -183,16 +244,22 @@ func fetchRapidDNS(ip string) (string, error) {
 }
 
 func fetchCRTSHByIP(ip string) (string, error) {
-	// crt.sh est partagé et lent : timeout long, pas de retry agressif
-	return doGETWithTimeout(fmt.Sprintf("https://crt.sh/?q=%s&output=json", ip), 20*time.Second, 1)
+	body, err := doGETWithTimeout(fmt.Sprintf("https://crt.sh/?q=%s&output=json", ip), 20*time.Second, 1)
+	if err != nil {
+		return "", err
+	}
+	if isHTML(body) {
+		return "", fmt.Errorf("crtsh: HTML response (rate-limited?)")
+	}
+	return body, nil
 }
 
-// webscan.cc — reverse IP JSON
 func fetchWebscan(ip string) (string, error) {
 	return doGET("https://api.webscan.cc/?action=query&ip=" + ip)
 }
 
 func query(s *Source, ip string) string {
+	atomic.AddUint64(&s.reqTotal, 1)
 	var body string
 	var err error
 	switch s.name {
@@ -207,6 +274,7 @@ func query(s *Source, ip string) string {
 	}
 	if err != nil {
 		s.fail()
+		logWarn("%-10s %-16s → %v", s.name, ip, err)
 		return ""
 	}
 	s.ok()
@@ -221,6 +289,7 @@ var seen sync.Map
 
 func clean(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSuffix(s, ".") // Robtex FQDNs have a trailing dot
 	s = strings.TrimPrefix(s, "*.")
 	if len(s) < 4 || !strings.Contains(s, ".") {
 		return ""
@@ -231,54 +300,78 @@ func clean(s string) string {
 	return s
 }
 
-func emit(d string, out chan<- string) {
+func emit(d string, out chan<- string) bool {
 	d = clean(d)
 	if d == "" {
-		return
+		return false
 	}
 	if _, loaded := seen.LoadOrStore(d, struct{}{}); !loaded {
 		out <- d
+		return true
 	}
+	return false
 }
 
-// Robtex NDJSON
-func parseRobtex(body string, out chan<- string) {
+// parseRobtex handles NDJSON; skips heartbeat lines ({"time":N}, {"msg":"..."}).
+func parseRobtex(body string, out chan<- string) int {
+	count := 0
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		var obj map[string]interface{}
+		var obj map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			continue
 		}
+		// heartbeat / error lines carry "msg" or only "time"
+		if _, hasMsg := obj["msg"]; hasMsg {
+			continue
+		}
 		for _, k := range []string{"rrname", "rdata"} {
-			if v, ok := obj[k].(string); ok {
-				emit(v, out)
+			if raw, ok := obj[k]; ok {
+				var v string
+				if json.Unmarshal(raw, &v) == nil {
+					if emit(v, out) {
+						count++
+					}
+				}
 			}
 		}
 	}
+	return count
 }
 
-// crt.sh JSON
+// crtEntry covers both the IP-query and the apex-wildcard responses.
 type crtEntry struct {
-	NameValue string `json:"name_value"`
+	CommonName string `json:"common_name"`
+	NameValue  string `json:"name_value"`
 }
 
-func parseCRTSH(body string, out chan<- string) {
+func parseCRTSH(body string, out chan<- string) int {
+	if isHTML(body) {
+		return 0
+	}
 	var entries []crtEntry
 	if err := json.Unmarshal([]byte(body), &entries); err != nil {
-		return
+		return 0
 	}
+	count := 0
 	for _, e := range entries {
+		if emit(e.CommonName, out) {
+			count++
+		}
 		for _, line := range strings.Split(e.NameValue, "\n") {
-			emit(line, out)
+			if emit(line, out) {
+				count++
+			}
 		}
 	}
+	return count
 }
 
-// RapidDNS HTML — domains in <td>
-func parseRapidDNS(body string, out chan<- string) {
+func parseRapidDNS(body string, out chan<- string) int {
+	count := 0
 	for {
 		start := strings.Index(body, "<td>")
 		if start == -1 {
@@ -294,46 +387,57 @@ func parseRapidDNS(body string, out chan<- string) {
 		if strings.Contains(tok, "<") || !strings.Contains(tok, ".") {
 			continue
 		}
-		emit(tok, out)
+		if emit(tok, out) {
+			count++
+		}
 	}
+	return count
 }
 
-// webscan.cc JSON: [{"domain":"...","title":"..."},...]
-func parseWebscan(body string, out chan<- string) {
+func parseWebscan(body string, out chan<- string) int {
 	var entries []struct {
 		Domain string `json:"domain"`
 	}
 	if err := json.Unmarshal([]byte(body), &entries); err != nil {
-		return
+		return 0
 	}
+	count := 0
 	for _, e := range entries {
 		d := e.Domain
 		d = strings.TrimPrefix(d, "http://")
 		d = strings.TrimPrefix(d, "https://")
 		d = strings.SplitN(d, "/", 2)[0]
-		emit(d, out)
+		if emit(d, out) {
+			count++
+		}
 	}
+	return count
 }
 
-func parseBody(src string, body string, out chan<- string) {
+func parseBody(src, body string, out chan<- string) int {
 	switch src {
 	case "robtex":
-		parseRobtex(body, out)
+		return parseRobtex(body, out)
 	case "rapiddns":
-		parseRapidDNS(body, out)
+		return parseRapidDNS(body, out)
 	case "crtsh_ip":
-		parseCRTSH(body, out)
+		return parseCRTSH(body, out)
 	case "webscan":
-		parseWebscan(body, out)
+		return parseWebscan(body, out)
 	}
+	return 0
 }
 
 // ─────────────────────────────────────────────
-//  CRT.SH ENRICHMENT (apex domain)
+//  CRT.SH ENRICHMENT  (apex wildcard query)
 // ─────────────────────────────────────────────
 
-var crtSeen sync.Map
-var crtSem = make(chan struct{}, 15)
+var (
+	crtSeen sync.Map
+	crtSem  = make(chan struct{}, CRT_CONCUR)
+	// crtWg tracks goroutines so main can wait before closing results.
+	crtWg sync.WaitGroup
+)
 
 func enrichCRT(domain string, out chan<- string) {
 	parts := strings.Split(domain, ".")
@@ -345,13 +449,22 @@ func enrichCRT(domain string, out chan<- string) {
 		return
 	}
 	crtSem <- struct{}{}
+	crtWg.Add(1)
 	go func() {
-		defer func() { <-crtSem }()
-		body, err := doGET(fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", apex))
+		defer func() {
+			<-crtSem
+			crtWg.Done()
+		}()
+		url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", apex)
+		body, err := doGETWithTimeout(url, 25*time.Second, 1)
 		if err != nil {
+			logWarn("crtsh enrich %-30s → %v", apex, err)
 			return
 		}
-		parseCRTSH(body, out)
+		n := parseCRTSH(body, out)
+		if n > 0 {
+			logInfo("crtsh enrich %-30s → %d new domains", apex, n)
+		}
 	}()
 }
 
@@ -366,20 +479,32 @@ var (
 )
 
 func statsLoop() {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(STATS_EVERY)
 	defer t.Stop()
 	for range t.C {
 		ips := atomic.LoadUint64(&ipsProcessed)
 		doms := atomic.LoadUint64(&domainsFound)
 		elapsed := time.Since(start).Seconds()
-		fmt.Printf("[stats] IPs=%d  domains=%d  %.1f IP/s  elapsed=%s\n",
-			ips, doms, float64(ips)/elapsed, time.Since(start).Round(time.Second))
+		rate := 0.0
+		if elapsed > 0 {
+			rate = float64(ips) / elapsed
+		}
+		logStats("IPs=%-8d  domains=%-8d  %.1f IP/s  elapsed=%s",
+			ips, doms, rate, time.Since(start).Round(time.Second))
 		for _, s := range sources {
-			st := "OK"
+			state := ansi("OK      ", "\033[32m")
 			if s.isDisabled() {
-				st = "DISABLED"
+				state = ansi("DISABLED", "\033[31m")
 			}
-			fmt.Printf("  %-12s  errs=%d  %s\n", s.name, atomic.LoadInt32(&s.errCount), st)
+			reqs := atomic.LoadUint64(&s.reqTotal)
+			succ := atomic.LoadUint64(&s.reqSuccess)
+			sdoms := atomic.LoadUint64(&s.domsFound)
+			pct := 0.0
+			if reqs > 0 {
+				pct = float64(succ) / float64(reqs) * 100
+			}
+			logStats("  %-12s  reqs=%-6d  ok=%-6d (%.0f%%)  domains=%-8d  errs=%d  %s",
+				s.name, reqs, succ, pct, sdoms, atomic.LoadInt32(&s.errCount), state)
 		}
 	}
 }
@@ -391,21 +516,21 @@ func statsLoop() {
 func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for ip := range jobs {
-		used := map[string]bool{}
-		for round := 0; round < 2; round++ {
-			src := nextSource()
-			if used[src.name] {
-				for _, s := range sources {
-					if !used[s.name] && !s.isDisabled() {
-						src = s
-						break
-					}
-				}
+		tried := make(map[string]bool, ROUNDS)
+		queried := 0
+		// Pick a starting offset unique to this IP slot to spread load across the pool.
+		startIdx := atomic.AddUint64(&poolIdx, 1)
+		for queried < ROUNDS {
+			src := pickSources(startIdx+uint64(queried), tried)
+			if src == nil {
+				break // all sources tried or disabled
 			}
-			used[src.name] = true
+			tried[src.name] = true
+			queried++
 			body := query(src, ip)
 			if body != "" {
-				parseBody(src.name, body, out)
+				n := parseBody(src.name, body, out)
+				src.addDoms(n)
 			}
 		}
 		atomic.AddUint64(&ipsProcessed, 1)
@@ -419,6 +544,7 @@ func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 func writer(results chan string, done chan<- struct{}) {
 	f, err := os.Create("domains.txt")
 	if err != nil {
+		logError("cannot create domains.txt: %v", err)
 		panic(err)
 	}
 	defer f.Close()
@@ -437,7 +563,10 @@ func writer(results chan string, done chan<- struct{}) {
 				return
 			}
 			w.WriteString(d + "\n")
-			atomic.AddUint64(&domainsFound, 1)
+			n := atomic.AddUint64(&domainsFound, 1)
+			if n%10_000 == 0 {
+				logInfo("milestone: %d domains found", n)
+			}
 			enrichCRT(d, results)
 		case <-tick.C:
 			w.Flush()
@@ -450,14 +579,13 @@ func writer(results chan string, done chan<- struct{}) {
 // ─────────────────────────────────────────────
 
 func main() {
-	fmt.Printf("[+] starting  workers=%d  sources=%d\n", WORKERS, len(sources))
+	logInfo("starting  workers=%d  sources=%d  rounds/IP=%d", WORKERS, len(sources), ROUNDS)
 
 	jobs := make(chan string, JOB_BUF)
 	results := make(chan string, RESULT_BUF)
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
-
 	for i := 0; i < WORKERS; i++ {
 		wg.Add(1)
 		go worker(jobs, results, &wg)
@@ -468,24 +596,30 @@ func main() {
 
 	f, err := os.Open("ips.txt")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "[-] cannot open ips.txt:", err)
+		logError("cannot open ips.txt: %v", err)
 		os.Exit(1)
 	}
 	sc := bufio.NewScanner(f)
+	ipCount := 0
 	for sc.Scan() {
 		ip := strings.TrimSpace(sc.Text())
 		if ip != "" && !strings.HasPrefix(ip, "#") {
 			jobs <- ip
+			ipCount++
 		}
 	}
 	f.Close()
+	logInfo("loaded %d IPs — waiting for workers...", ipCount)
 	close(jobs)
 
 	wg.Wait()
+	logInfo("workers done — waiting for crt.sh enrichment goroutines...")
+	crtWg.Wait() // must drain before closing results to avoid panic on write to closed chan
+
 	close(results)
 	<-done
 
-	fmt.Printf("\n[+] done  IPs=%d  domains=%d  time=%s\n",
+	logInfo("done  IPs=%d  domains=%d  elapsed=%s",
 		atomic.LoadUint64(&ipsProcessed),
 		atomic.LoadUint64(&domainsFound),
 		time.Since(start).Round(time.Second),
