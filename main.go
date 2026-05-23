@@ -21,56 +21,99 @@ import (
 // ─────────────────────────────────────────────
 
 const (
-	// WORKERS matches total source capacity (sum of all maxConc).
-	// With blocking semaphores, each worker holds exactly one source slot at a time;
-	// keeping WORKERS ≈ total slots avoids both idle workers and semaphore pile-ups.
 	WORKERS       = 80
-	ROUNDS        = 3 // distinct sources queried per IP
+	ROUNDS        = 3
 	JOB_BUF       = 50_000
 	RESULT_BUF    = 100_000
 	HTTP_TIMEOUT  = 10 * time.Second
 	MAX_RETRIES   = 2
 	BACKOFF_BASE  = 400 * time.Millisecond
-	ERR_THRESHOLD = 4  // fast disabling of unreliable sources
-	ERR_RESET     = 60 // seconds before re-enabling a disabled source
+	ERR_THRESHOLD = 4
+	ERR_RESET     = 60
 	CRT_CONCUR    = 5
 	STATS_EVERY   = 15 * time.Second
 	FLUSH_EVERY   = 2 * time.Second
 )
 
 // ─────────────────────────────────────────────
-//  LOGGER  (stderr · timestamp · levels · colors)
+//  ANSI / TTY
 // ─────────────────────────────────────────────
 
-var (
-	tty   = isatty(os.Stderr)
-	logMu sync.Mutex
+const (
+	aReset   = "\033[0m"
+	aBold    = "\033[1m"
+	aDim     = "\033[2m"
+	aGray    = "\033[90m"
+	aRed     = "\033[91m"
+	aGreen   = "\033[92m"
+	aYellow  = "\033[93m"
+	aBlue    = "\033[94m"
+	aMagenta = "\033[95m"
+	aCyan    = "\033[96m"
+	aWhite   = "\033[97m"
+	aClearLn = "\033[2K\r"
 )
+
+var tty = isatty(os.Stderr)
 
 func isatty(f *os.File) bool {
 	fi, _ := f.Stat()
 	return fi != nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-func ansi(s, code string) string {
+func c(code, s string) string {
 	if !tty {
 		return s
 	}
-	return code + s + "\033[0m"
+	return code + s + aReset
 }
 
-func logLine(level, code, format string, a ...interface{}) {
+// ─────────────────────────────────────────────
+//  LOGGER
+// ─────────────────────────────────────────────
+
+var logMu sync.Mutex
+
+func logLine(sym, symColor, msgColor, format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
-	ts := time.Now().Format("15:04:05")
+	ts := c(aGray, time.Now().Format("15:04:05"))
+	symbol := c(symColor, sym)
 	logMu.Lock()
-	fmt.Fprintf(os.Stderr, "%s %s %s\n", ansi(ts, "\033[90m"), ansi(level, code), msg)
+	// Clear the progress bar line before printing, then reprint it after.
+	if tty {
+		fmt.Fprint(os.Stderr, aClearLn)
+	}
+	fmt.Fprintf(os.Stderr, "%s %s  %s\n", ts, symbol, c(msgColor, msg))
 	logMu.Unlock()
 }
 
-func logInfo(f string, a ...interface{})  { logLine("[INFO]", "\033[36m", f, a...) }
-func logWarn(f string, a ...interface{})  { logLine("[WARN]", "\033[33m", f, a...) }
-func logError(f string, a ...interface{}) { logLine("[ERR] ", "\033[31m", f, a...) }
-func logStats(f string, a ...interface{}) { logLine("[STAT]", "\033[32m", f, a...) }
+func logInfo(f string, a ...interface{})  { logLine("◆", aCyan, aWhite, f, a...) }
+func logWarn(f string, a ...interface{})  { logLine("▲", aYellow, aYellow, f, a...) }
+func logError(f string, a ...interface{}) { logLine("✖", aRed, aRed, f, a...) }
+func logStats(f string, a ...interface{}) { logLine("●", aGreen, aGray, f, a...) }
+
+// ─────────────────────────────────────────────
+//  BANNER
+// ─────────────────────────────────────────────
+
+func printBanner() {
+	if !tty {
+		return
+	}
+	fmt.Fprint(os.Stderr, c(aMagenta+aBold, `
+  ██████╗ ███████╗██╗   ██╗██╗██████╗
+  ██╔══██╗██╔════╝██║   ██║██║██╔══██╗
+  ██████╔╝█████╗  ██║   ██║██║██████╔╝
+  ██╔══██╗██╔══╝  ╚██╗ ██╔╝██║██╔═══╝
+  ██║  ██║███████╗ ╚████╔╝ ██║██║
+  ╚═╝  ╚═╝╚══════╝  ╚═══╝  ╚═╝╚═╝
+`))
+	fmt.Fprintf(os.Stderr, "  %s %s  %s\n\n",
+		c(aGray, "mass reverse IP lookup  ·"),
+		c(aCyan, fmt.Sprintf("workers=%d", WORKERS)),
+		c(aGray, "sources: robtex · rapiddns · webscan · urlscan · viewdns · crt.sh"),
+	)
+}
 
 // ─────────────────────────────────────────────
 //  HTTP CLIENT
@@ -95,15 +138,11 @@ var httpClient = &http.Client{
 // ─────────────────────────────────────────────
 
 type Source struct {
-	name   string
-	weight int
-	// sem caps concurrent in-flight requests for this source.
-	// Workers block on acquire — WORKERS is sized to match total capacity so
-	// contention stays low and no worker starves indefinitely.
+	name       string
+	weight     int
 	sem        chan struct{}
 	errCount   int32
 	disabledAt int64
-	// stats
 	reqTotal   uint64
 	reqSuccess uint64
 	domsFound  uint64
@@ -114,14 +153,11 @@ func newSource(name string, weight, maxConc int) *Source {
 }
 
 var sources = []*Source{
-	//               name          weight  maxConc  (sum = 77 ≈ WORKERS)
-	newSource("robtex",    1,   5),
-	newSource("rapiddns",  3,  20),
-	newSource("webscan",   3,  20),
-	newSource("urlscan",   2,  12),
-	newSource("viewdns",   3,  20), // works on residential IPs; cloud IPs get 403
-	// crtsh_ip removed: always timeout/429 on this env, and crt.sh data is already
-	// covered by enrichCRT() apex lookups which run independently of the worker pool.
+	newSource("robtex",   1,  5),
+	newSource("rapiddns", 3, 20),
+	newSource("webscan",  3, 20),
+	newSource("urlscan",  2, 12),
+	newSource("viewdns",  3, 20),
 }
 
 func (s *Source) isDisabled() bool {
@@ -170,8 +206,6 @@ func init() {
 	}
 }
 
-// pickSource scans the weighted pool from startIdx and returns the first
-// source that is neither disabled nor already in the skip set.
 func pickSource(startIdx uint64, skip map[string]bool) *Source {
 	n := uint64(len(pool))
 	for i := uint64(0); i < n; i++ {
@@ -264,7 +298,6 @@ func fetchWebscan(ip string) (string, error) {
 	return doGET("https://api.webscan.cc/?action=query&ip=" + ip)
 }
 
-// fetchViewDNS scrapes viewdns.info with browser-like headers to avoid WAF blocks.
 func fetchViewDNS(ip string) (string, error) {
 	cl := &http.Client{Timeout: HTTP_TIMEOUT, Transport: httpClient.Transport}
 	u := "https://viewdns.info/reverseip/?host=" + ip
@@ -312,11 +345,8 @@ func fetchURLScan(ip string) (string, error) {
 	return body, nil
 }
 
-// query makes an HTTP request to source s for ip.
-// Blocks until a concurrency slot is available (WORKERS ≈ total slots so
-// contention is low), then performs the HTTP fetch.
 func query(s *Source, ip string) string {
-	s.sem <- struct{}{} // blocking acquire
+	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
 
 	atomic.AddUint64(&s.reqTotal, 1)
@@ -351,9 +381,8 @@ var seen sync.Map
 
 func clean(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.TrimSuffix(s, ".") // Robtex appends a trailing dot to FQDNs
+	s = strings.TrimSuffix(s, ".")
 	s = strings.TrimPrefix(s, "*.")
-	// Strip port number (e.g. "example.com:8080" → "example.com")
 	if i := strings.LastIndex(s, ":"); i != -1 {
 		s = s[:i]
 	}
@@ -390,7 +419,7 @@ func parseRobtex(body string, out chan<- string) int {
 			continue
 		}
 		if _, hasMsg := obj["msg"]; hasMsg {
-			continue // heartbeat / error line
+			continue
 		}
 		for _, k := range []string{"rrname", "rdata"} {
 			if raw, ok := obj[k]; ok {
@@ -475,11 +504,8 @@ func parseWebscan(body string, out chan<- string) int {
 	return count
 }
 
-// parseViewDNS scrapes the HTML table from viewdns.info reverseip.
-// The results table contains two columns: domain name and last resolved date.
 func parseViewDNS(body string, out chan<- string) int {
 	count := 0
-	// Find the results table (skip the first two header tables)
 	tableStart := 0
 	for i := 0; i < 3; i++ {
 		idx := strings.Index(body[tableStart:], "<table")
@@ -505,7 +531,6 @@ func parseViewDNS(body string, out chan<- string) int {
 		}
 		tok := strings.TrimSpace(section[:end])
 		section = section[end+5:]
-		// Skip the "Last Resolved" date column (contains digits and dashes only)
 		if !strings.Contains(tok, "<") && strings.Contains(tok, ".") {
 			if emit(tok, out) {
 				count++
@@ -561,14 +586,13 @@ func parseBody(src, body string, out chan<- string) int {
 }
 
 // ─────────────────────────────────────────────
-//  CRT.SH ENRICHMENT  (apex wildcard query)
+//  CRT.SH ENRICHMENT
 // ─────────────────────────────────────────────
 
 var (
 	crtSeen sync.Map
 	crtSem  = make(chan struct{}, CRT_CONCUR)
-	// crtWg prevents closing results while goroutines are still writing to it.
-	crtWg sync.WaitGroup
+	crtWg   sync.WaitGroup
 )
 
 func enrichCRT(domain string, out chan<- string) {
@@ -580,13 +604,10 @@ func enrichCRT(domain string, out chan<- string) {
 	if _, loaded := crtSeen.LoadOrStore(apex, struct{}{}); loaded {
 		return
 	}
-	// Non-blocking acquire: if all CRT_CONCUR slots are busy we drop this apex
-	// rather than spawning an unbounded goroutine queue that blocks crtWg.Wait()
-	// for hours when tens of thousands of unique apexes are discovered.
 	select {
 	case crtSem <- struct{}{}:
 	default:
-		return // slots full, skip
+		return
 	}
 	crtWg.Add(1)
 	go func() {
@@ -597,55 +618,225 @@ func enrichCRT(domain string, out chan<- string) {
 		url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", apex)
 		body, err := doGETWithTimeout(url, 25*time.Second, 1)
 		if err != nil {
-			logWarn("crtsh enrich %-30s → %v", apex, err)
+			logWarn("crtsh %-30s → %v", apex, err)
 			return
 		}
 		n := parseCRTSH(body, out)
 		if n > 0 {
-			logInfo("crtsh enrich %-30s → %d new domains", apex, n)
+			logInfo("crtsh %-30s → %s new domains", apex, c(aGreen, fmt.Sprintf("%d", n)))
 		}
 	}()
 }
 
 // ─────────────────────────────────────────────
-//  STATS
+//  STATS & PROGRESS
 // ─────────────────────────────────────────────
 
 var (
 	ipsProcessed uint64
 	domainsFound uint64
+	totalIPs     uint64
 	start        = time.Now()
 )
 
+func progressBar(done, total uint64, width int) string {
+	if total == 0 {
+		return strings.Repeat("░", width)
+	}
+	filled := int(done * uint64(width) / total)
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return bar
+}
+
+func fmtDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+func fmtNum(n uint64) string {
+	s := fmt.Sprintf("%d", n)
+	out := ""
+	for i, ch := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out += ","
+		}
+		out += string(ch)
+	}
+	return out
+}
+
+func printProgress() {
+	if !tty {
+		return
+	}
+	ips := atomic.LoadUint64(&ipsProcessed)
+	total := atomic.LoadUint64(&totalIPs)
+	doms := atomic.LoadUint64(&domainsFound)
+	elapsed := time.Since(start)
+	rate := 0.0
+	if elapsed.Seconds() > 0 {
+		rate = float64(ips) / elapsed.Seconds()
+	}
+
+	pct := 0.0
+	eta := ""
+	if total > 0 {
+		pct = float64(ips) / float64(total) * 100
+		if rate > 0 && ips < total {
+			remaining := time.Duration(float64(total-ips)/rate) * time.Second
+			eta = "  ETA " + c(aYellow, fmtDuration(remaining))
+		}
+	}
+
+	bar := c(aCyan, progressBar(ips, total, 24))
+	progress := fmt.Sprintf(" %s %s/%s  [%s]  %.1f%%  %s domains  %.1f IP/s%s  %s",
+		c(aMagenta+aBold, "▶"),
+		c(aWhite, fmtNum(ips)),
+		c(aGray, fmtNum(total)),
+		bar,
+		pct,
+		c(aGreen, fmtNum(doms)),
+		rate,
+		eta,
+		c(aGray, fmtDuration(elapsed)),
+	)
+
+	logMu.Lock()
+	fmt.Fprint(os.Stderr, aClearLn+progress)
+	logMu.Unlock()
+}
+
+func printSourceTable() {
+	if !tty {
+		return
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	fmt.Fprint(os.Stderr, aClearLn)
+	fmt.Fprintf(os.Stderr, "  %s\n",
+		c(aGray, "┌─────────────┬─────────┬────────┬──────┬────────────┬───────┬──────────┐"))
+	fmt.Fprintf(os.Stderr, "  %s %-13s%s %-9s%s %-7s%s %-5s%s %-10s%s %-6s%s %-9s%s\n",
+		c(aGray, "│"), c(aBold, "Source"),
+		c(aGray, "│"), c(aBold, "Requests"),
+		c(aGray, "│"), c(aBold, "OK %"),
+		c(aGray, "│"), c(aBold, "Act"),
+		c(aGray, "│"), c(aBold, "Domains"),
+		c(aGray, "│"), c(aBold, "Errs"),
+		c(aGray, "│"), c(aBold, "Status"),
+		c(aGray, "│"),
+	)
+	fmt.Fprintf(os.Stderr, "  %s\n",
+		c(aGray, "├─────────────┼─────────┼────────┼──────┼────────────┼───────┼──────────┤"))
+
+	for _, s := range sources {
+		reqs := atomic.LoadUint64(&s.reqTotal)
+		succ := atomic.LoadUint64(&s.reqSuccess)
+		doms := atomic.LoadUint64(&s.domsFound)
+		errs := atomic.LoadInt32(&s.errCount)
+		inFlight := len(s.sem)
+		pct := 0.0
+		if reqs > 0 {
+			pct = float64(succ) / float64(reqs) * 100
+		}
+
+		var state string
+		if s.isDisabled() {
+			state = c(aRed, "✖ DISABLED")
+		} else if inFlight > 0 {
+			state = c(aGreen, "✔ active  ")
+		} else {
+			state = c(aGray, "  idle    ")
+		}
+
+		errCol := c(aGray, fmt.Sprintf("%d", errs))
+		if errs > 0 {
+			errCol = c(aYellow, fmt.Sprintf("%d", errs))
+		}
+
+		pctCol := fmt.Sprintf("%.0f%%", pct)
+		if pct < 50 {
+			pctCol = c(aRed, pctCol)
+		} else if pct < 80 {
+			pctCol = c(aYellow, pctCol)
+		} else {
+			pctCol = c(aGreen, pctCol)
+		}
+
+		fmt.Fprintf(os.Stderr, "  %s %-13s%s %-9s%s %-15s%s %-5d%s %-10s%s %-14s%s %-17s%s\n",
+			c(aGray, "│"), c(aCyan, s.name),
+			c(aGray, "│"), fmtNum(reqs),
+			c(aGray, "│"), pctCol,
+			c(aGray, "│"), inFlight,
+			c(aGray, "│"), c(aGreen, fmtNum(doms)),
+			c(aGray, "│"), errCol,
+			c(aGray, "│"), state,
+			c(aGray, "│"),
+		)
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s\n",
+		c(aGray, "└─────────────┴─────────┴────────┴──────┴────────────┴───────┴──────────┘"))
+}
+
 func statsLoop() {
-	t := time.NewTicker(STATS_EVERY)
-	defer t.Stop()
-	for range t.C {
-		ips := atomic.LoadUint64(&ipsProcessed)
-		doms := atomic.LoadUint64(&domainsFound)
-		elapsed := time.Since(start).Seconds()
-		rate := 0.0
-		if elapsed > 0 {
-			rate = float64(ips) / elapsed
+	progTick := time.NewTicker(500 * time.Millisecond)
+	tableTick := time.NewTicker(STATS_EVERY)
+	defer progTick.Stop()
+	defer tableTick.Stop()
+	for {
+		select {
+		case <-progTick.C:
+			printProgress()
+		case <-tableTick.C:
+			printSourceTable()
 		}
-		logStats("IPs=%-8d  domains=%-8d  %.1f IP/s  elapsed=%s",
-			ips, doms, rate, time.Since(start).Round(time.Second))
-		for _, s := range sources {
-			state := ansi("OK      ", "\033[32m")
-			if s.isDisabled() {
-				state = ansi("DISABLED", "\033[31m")
-			}
-			reqs := atomic.LoadUint64(&s.reqTotal)
-			succ := atomic.LoadUint64(&s.reqSuccess)
-			sdoms := atomic.LoadUint64(&s.domsFound)
-			inFlight := len(s.sem) // goroutines currently holding a slot
-			pct := 0.0
-			if reqs > 0 {
-				pct = float64(succ) / float64(reqs) * 100
-			}
-			logStats("  %-12s  reqs=%-6d  ok=%-6d(%.0f%%)  active=%-3d  doms=%-8d  errs=%d  %s",
-				s.name, reqs, succ, pct, inFlight, sdoms, atomic.LoadInt32(&s.errCount), state)
-		}
+	}
+}
+
+func printSummary() {
+	ips := atomic.LoadUint64(&ipsProcessed)
+	doms := atomic.LoadUint64(&domainsFound)
+	elapsed := time.Since(start).Round(time.Second)
+	rate := 0.0
+	if elapsed.Seconds() > 0 {
+		rate = float64(ips) / elapsed.Seconds()
+	}
+
+	if tty {
+		logMu.Lock()
+		fmt.Fprint(os.Stderr, aClearLn)
+		fmt.Fprintf(os.Stderr, "\n  %s\n", c(aGray, "┌──────────────────────────────────┐"))
+		fmt.Fprintf(os.Stderr, "  %s  %s  %s\n",
+			c(aGray, "│"), c(aBold+aGreen, "       RUN COMPLETE               "), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s\n", c(aGray, "├──────────────────────────────────┤"))
+		fmt.Fprintf(os.Stderr, "  %s  IPs processed  %s%s\n",
+			c(aGray, "│"), c(aWhite, fmt.Sprintf("%-16s", fmtNum(ips))), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s  Domains found  %s%s\n",
+			c(aGray, "│"), c(aGreen, fmt.Sprintf("%-16s", fmtNum(doms))), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s  Throughput     %s%s\n",
+			c(aGray, "│"), c(aCyan, fmt.Sprintf("%-16s", fmt.Sprintf("%.1f IP/s", rate))), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s  Elapsed        %s%s\n",
+			c(aGray, "│"), c(aYellow, fmt.Sprintf("%-16s", fmtDuration(elapsed))), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s  Output         %s%s\n",
+			c(aGray, "│"), c(aMagenta, fmt.Sprintf("%-16s", "domains.txt")), c(aGray, "│"))
+		fmt.Fprintf(os.Stderr, "  %s\n\n", c(aGray, "└──────────────────────────────────┘"))
+		logMu.Unlock()
+	} else {
+		fmt.Fprintf(os.Stderr, "done  IPs=%d  domains=%d  %.1f IP/s  elapsed=%s\n",
+			ips, doms, rate, fmtDuration(elapsed))
 	}
 }
 
@@ -656,7 +847,6 @@ func statsLoop() {
 func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for ip := range jobs {
-		// PTR record — pure DNS, no semaphore needed, always runs first.
 		if ptrs, err := net.LookupAddr(ip); err == nil {
 			for _, ptr := range ptrs {
 				emit(ptr, out)
@@ -674,7 +864,7 @@ func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 			}
 			tried[src.name] = true
 			queried++
-			body := query(src, ip) // blocking — worker waits for a source slot
+			body := query(src, ip)
 			if body != "" {
 				n := parseBody(src.name, body, out)
 				src.addDoms(n)
@@ -712,7 +902,7 @@ func writer(results chan string, done chan<- struct{}) {
 			w.WriteString(d + "\n")
 			n := atomic.AddUint64(&domainsFound, 1)
 			if n%10_000 == 0 {
-				logInfo("milestone: %d domains found", n)
+				logInfo("milestone: %s domains found", c(aGreen+aBold, fmtNum(n)))
 			}
 			enrichCRT(d, results)
 		case <-tick.C:
@@ -726,9 +916,34 @@ func writer(results chan string, done chan<- struct{}) {
 // ─────────────────────────────────────────────
 
 func main() {
-	logInfo("starting  workers=%d  sources=%d  rounds/IP=%d", WORKERS, len(sources), ROUNDS)
+	printBanner()
+
+	// Count IPs first for the progress bar.
+	ipFile, err := os.Open("ips.txt")
+	if err != nil {
+		logError("cannot open ips.txt: %v", err)
+		os.Exit(1)
+	}
+	var ipLines []string
+	sc := bufio.NewScanner(ipFile)
+	for sc.Scan() {
+		ip := strings.TrimSpace(sc.Text())
+		if ip != "" && !strings.HasPrefix(ip, "#") {
+			ipLines = append(ipLines, ip)
+		}
+	}
+	ipFile.Close()
+	atomic.StoreUint64(&totalIPs, uint64(len(ipLines)))
+
+	logInfo("loaded %s IPs  workers=%s  rounds/IP=%s  sources=%s",
+		c(aWhite+aBold, fmtNum(uint64(len(ipLines)))),
+		c(aCyan, fmt.Sprintf("%d", WORKERS)),
+		c(aCyan, fmt.Sprintf("%d", ROUNDS)),
+		c(aCyan, fmt.Sprintf("%d", len(sources))),
+	)
 	for _, s := range sources {
-		logInfo("  %-12s  weight=%-2d  maxConc=%d", s.name, s.weight, cap(s.sem))
+		logInfo("  %-12s  weight=%-2d  maxConc=%s",
+			c(aCyan, s.name), s.weight, c(aGray, fmt.Sprintf("%d", cap(s.sem))))
 	}
 
 	jobs := make(chan string, JOB_BUF)
@@ -744,7 +959,6 @@ func main() {
 	go writer(results, done)
 	go statsLoop()
 
-	// Graceful shutdown on SIGINT/SIGTERM: stop feeding jobs so the pipeline drains.
 	var closeOnce sync.Once
 	closeJobs := func() { closeOnce.Do(func() { close(jobs) }) }
 	go func() {
@@ -755,34 +969,17 @@ func main() {
 		closeJobs()
 	}()
 
-	f, err := os.Open("ips.txt")
-	if err != nil {
-		logError("cannot open ips.txt: %v", err)
-		os.Exit(1)
+	for _, ip := range ipLines {
+		jobs <- ip
 	}
-	sc := bufio.NewScanner(f)
-	ipCount := 0
-	for sc.Scan() {
-		ip := strings.TrimSpace(sc.Text())
-		if ip != "" && !strings.HasPrefix(ip, "#") {
-			jobs <- ip
-			ipCount++
-		}
-	}
-	f.Close()
-	logInfo("loaded %d IPs — waiting for workers...", ipCount)
 	closeJobs()
 
 	wg.Wait()
-	logInfo("workers done — flushing crt.sh enrichment goroutines...")
+	logInfo("workers done — flushing crt.sh enrichment...")
 	crtWg.Wait()
 
 	close(results)
 	<-done
 
-	logInfo("done  IPs=%d  domains=%d  elapsed=%s",
-		atomic.LoadUint64(&ipsProcessed),
-		atomic.LoadUint64(&domainsFound),
-		time.Since(start).Round(time.Second),
-	)
+	printSummary()
 }
