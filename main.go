@@ -656,6 +656,13 @@ func statsLoop() {
 func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for ip := range jobs {
+		// PTR record — pure DNS, no semaphore needed, always runs first.
+		if ptrs, err := net.LookupAddr(ip); err == nil {
+			for _, ptr := range ptrs {
+				emit(ptr, out)
+			}
+		}
+
 		tried := make(map[string]bool, len(sources))
 		queried := 0
 		startIdx := atomic.AddUint64(&poolIdx, 1)
