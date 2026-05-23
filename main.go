@@ -113,7 +113,7 @@ func printBanner() {
 	fmt.Fprintf(os.Stderr, "  %s %s  %s\n\n",
 		c(aGray, "mass reverse IP lookup  ·"),
 		c(aCyan, fmt.Sprintf("workers=%d", WORKERS)),
-		c(aGray, "sources: robtex · rapiddns · webscan · urlscan · viewdns · crt.sh"),
+		c(aGray, "sources: robtex · rapiddns · webscan · urlscan · viewdns · otx"),
 	)
 }
 
@@ -160,6 +160,7 @@ var sources = []*Source{
 	newSource("webscan",  3, 20),
 	newSource("urlscan",  2, 12),
 	newSource("viewdns",  3, 20),
+	newSource("otx",      3, 15), // AlienVault OTX passive DNS — no auth, up to 500 results/IP
 }
 
 func (s *Source) isDisabled() bool {
@@ -347,6 +348,20 @@ func fetchURLScan(ip string) (string, error) {
 	return body, nil
 }
 
+func fetchOTX(ip string) (string, error) {
+	body, err := doGETWithTimeout(
+		fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip),
+		15*time.Second, 1,
+	)
+	if err != nil {
+		return "", err
+	}
+	if isHTML(body) {
+		return "", fmt.Errorf("HTML response (blocked?)")
+	}
+	return body, nil
+}
+
 func query(s *Source, ip string) string {
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
@@ -365,6 +380,8 @@ func query(s *Source, ip string) string {
 		body, err = fetchURLScan(ip)
 	case "viewdns":
 		body, err = fetchViewDNS(ip)
+	case "otx":
+		body, err = fetchOTX(ip)
 	}
 	if err != nil {
 		s.fail()
@@ -583,12 +600,35 @@ func parseBody(src, body string, out chan<- string) int {
 		return parseURLScan(body, out)
 	case "viewdns":
 		return parseViewDNS(body, out)
+	case "otx":
+		return parseOTX(body, out)
 	}
 	return 0
 }
 
+func parseOTX(body string, out chan<- string) int {
+	var result struct {
+		PassiveDNS []struct {
+			Hostname   string `json:"hostname"`
+			RecordType string `json:"record_type"`
+		} `json:"passive_dns"`
+	}
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range result.PassiveDNS {
+		if entry.RecordType == "A" || entry.RecordType == "AAAA" || entry.RecordType == "" {
+			if emit(entry.Hostname, out) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // ─────────────────────────────────────────────
-//  CRT.SH ENRICHMENT
+//  SUBDOMAIN ENRICHMENT  (certspotter)
 // ─────────────────────────────────────────────
 
 var (
@@ -597,12 +637,16 @@ var (
 	crtWg   sync.WaitGroup
 )
 
-func enrichCRT(domain string, out chan<- string) {
+func enrichSubdomains(domain string, out chan<- string) {
 	parts := strings.Split(domain, ".")
 	if len(parts) < 2 {
 		return
 	}
 	apex := parts[len(parts)-2] + "." + parts[len(parts)-1]
+	// Skip numeric-only or arpa apexes (IPs, PTR zones, etc.)
+	if strings.HasSuffix(apex, ".arpa") || !strings.ContainsAny(apex, "abcdefghijklmnopqrstuvwxyz") {
+		return
+	}
 	if _, loaded := crtSeen.LoadOrStore(apex, struct{}{}); loaded {
 		return
 	}
@@ -617,17 +661,35 @@ func enrichCRT(domain string, out chan<- string) {
 			<-crtSem
 			crtWg.Done()
 		}()
-		url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", apex)
-		body, err := doGETWithTimeout(url, 25*time.Second, 1)
+		url := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", apex)
+		body, err := doGETWithTimeout(url, 20*time.Second, 1)
 		if err != nil {
-			logWarn("crtsh %-30s → %v", apex, err)
+			logWarn("certspotter %-30s → %v", apex, err)
 			return
 		}
-		n := parseCRTSH(body, out)
+		n := parseCertspotter(body, out)
 		if n > 0 {
-			logInfo("crtsh %-30s → %s new domains", apex, c(aGreen, fmt.Sprintf("%d", n)))
+			logInfo("certspotter %-30s → %s new domains", apex, c(aGreen, fmt.Sprintf("%d", n)))
 		}
 	}()
+}
+
+func parseCertspotter(body string, out chan<- string) int {
+	var entries []struct {
+		DNSNames []string `json:"dns_names"`
+	}
+	if err := json.Unmarshal([]byte(body), &entries); err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		for _, name := range e.DNSNames {
+			if emit(name, out) {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // ─────────────────────────────────────────────
@@ -887,12 +949,6 @@ func printSummary() {
 func worker(jobs <-chan string, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for ip := range jobs {
-		if ptrs, err := net.LookupAddr(ip); err == nil {
-			for _, ptr := range ptrs {
-				emit(ptr, out)
-			}
-		}
-
 		tried := make(map[string]bool, len(sources))
 		queried := 0
 		startIdx := atomic.AddUint64(&poolIdx, 1)
@@ -944,7 +1000,7 @@ func writer(results chan string, done chan<- struct{}) {
 			if n%10_000 == 0 {
 				logInfo("milestone: %s domains found", c(aGreen+aBold, fmtNum(n)))
 			}
-			enrichCRT(d, results)
+			enrichSubdomains(d, results)
 		case <-tick.C:
 			w.Flush()
 		}
@@ -1015,7 +1071,7 @@ func main() {
 	closeJobs()
 
 	wg.Wait()
-	logInfo("workers done — flushing crt.sh enrichment...")
+	logInfo("workers done — flushing certspotter enrichment...")
 	crtWg.Wait()
 
 	close(results)
