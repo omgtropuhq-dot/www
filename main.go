@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // ─────────────────────────────────────────────
@@ -29,8 +31,8 @@ const (
 	MAX_RETRIES   = 2
 	BACKOFF_BASE  = 400 * time.Millisecond
 	ERR_THRESHOLD = 4
-	ERR_RESET     = 60
-	CRT_CONCUR    = 5
+	ERR_RESET     = 300 // 5 min before re-enabling — avoids spam re-enable/disable on cloud IPs
+	CRT_CONCUR    = 2   // crt.sh rate-limits aggressively; keep it low
 	STATS_EVERY   = 15 * time.Second
 	FLUSH_EVERY   = 2 * time.Second
 )
@@ -639,6 +641,42 @@ var (
 	start        = time.Now()
 )
 
+func termWidth() int {
+	type winsize struct{ Row, Col, Xpixel, Ypixel uint16 }
+	ws := winsize{}
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(os.Stderr.Fd()), syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(&ws)))
+	if ws.Col > 0 {
+		return int(ws.Col)
+	}
+	if v := os.Getenv("COLUMNS"); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			return n
+		}
+	}
+	return 120
+}
+
+// truncVis truncates s to maxVis visible characters, preserving ANSI escape codes.
+func truncVis(s string, maxVis int) string {
+	vis := 0
+	inEsc := false
+	for i, ch := range s {
+		if ch == '\033' {
+			inEsc = true
+		} else if inEsc {
+			if ch == 'm' {
+				inEsc = false
+			}
+		} else {
+			if vis >= maxVis {
+				return s[:i] + aReset
+			}
+			vis++
+		}
+	}
+	return s
+}
+
 func progressBar(done, total uint64, width int) string {
 	if total == 0 {
 		return strings.Repeat("░", width)
@@ -712,6 +750,8 @@ func printProgress() {
 		eta,
 		c(aGray, fmtDuration(elapsed)),
 	)
+
+	progress = truncVis(progress, termWidth()-2)
 
 	logMu.Lock()
 	fmt.Fprint(os.Stderr, aClearLn+progress)
