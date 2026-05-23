@@ -24,8 +24,8 @@ import (
 // ─────────────────────────────────────────────
 
 const (
-	// WORKERS ≈ sum of all source maxConc: 2+20+2+2 = 26
-	WORKERS       = 26
+	// WORKERS ≈ sum of all source maxConc: 2+40+2+2 = 46
+	WORKERS       = 46
 	ROUNDS        = 3
 	JOB_BUF       = 50_000
 	RESULT_BUF    = 100_000
@@ -158,7 +158,7 @@ func newSource(name string, weight, maxConc int) *Source {
 
 var sources = []*Source{
 	newSource("robtex",  1,  2), // 429s after burst; keep low
-	newSource("webscan", 3, 20), // most reliable on cloud IPs
+	newSource("webscan", 4, 40), // most reliable; scaled up for best throughput
 	newSource("urlscan", 2,  2), // 429s when >2 concurrent
 	newSource("otx",     2,  2), // AlienVault passive DNS; 429s when >2 concurrent
 }
@@ -253,8 +253,8 @@ var acceptLangs = []string{
 func randUA() string  { return userAgents[rand.Intn(len(userAgents))] }
 func randLang() string { return acceptLangs[rand.Intn(len(acceptLangs))] }
 
-// jitter adds a small random delay (50–250 ms) to smooth out request bursts.
-func jitter() { time.Sleep(time.Duration(50+rand.Intn(200)) * time.Millisecond) }
+// jitter adds a small random delay (20–80 ms) to smooth out request bursts.
+func jitter() { time.Sleep(time.Duration(20+rand.Intn(60)) * time.Millisecond) }
 
 func isHTML(body string) bool {
 	t := strings.TrimSpace(body)
